@@ -8,13 +8,6 @@ import { useTTS } from '@/app/lib/audio/useTTS'
 import { TemporalGate } from '@/app/lib/logic/temporal'
 import { checkRulesAtBottom } from '@/app/lib/logic/rules'
 
-/**
- * Camera + overlay + angles + rep FSM + bottom-only TTS cues.
- * Cleaned for ESLint:
- *  - No unused vars
- *  - No useEffect dependency warnings
- *  - Local fpsNow used for HUD drawing (we still set state for the label below)
- */
 export default function CameraCanvas() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -25,8 +18,15 @@ export default function CameraCanvas() {
   const [reps, setReps] = useState(0)
   const [camError, setCamError] = useState<string | null>(null)
 
-  // TTS hook: enable() must be called by a user gesture
+  // NEW: camera + mirroring controls
+  const [useFront, setUseFront] = useState(true) // front/selfie by default
+  const mirror = useFront // mirror both video & canvas together when using front camera
+
+  // TTS (1.2s cooldown inside the hook)
   const { enabled, enable, speak } = useTTS(1200)
+
+  // Keep a handle to stop the previous stream when switching cameras
+  const currentStream = useRef<MediaStream | null>(null)
 
   useEffect(() => {
     let raf = 0
@@ -36,17 +36,20 @@ export default function CameraCanvas() {
     let kneeSmoothed: number | null = null
     let trunkSmoothed: number | null = null
 
-    // state machine + temporal gates
+    // FSM + temporal gates
     let fsm = createFSM()
-    const depthGate = new TemporalGate(6, 4) // require 4/6 recent frames at depth
-
-    // Avoid repeating the same cue within one rep
+    const depthGate = new TemporalGate(6, 4) // require 4/6 depth frames at bottom
     let spokeCueTypeThisRep: null | 'depth' | 'trunk' | 'knee' = null
 
     async function start() {
       await initPose()
 
-      // Guard for HTTPS / permissions
+      // Stop any previous stream if switching cameras
+      if (currentStream.current) {
+        currentStream.current.getTracks().forEach(t => t.stop())
+        currentStream.current = null
+      }
+
       if (
         typeof navigator === 'undefined' ||
         !navigator.mediaDevices ||
@@ -56,10 +59,24 @@ export default function CameraCanvas() {
         return
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user' },
+      // Prefer 1280x720 for better joint confidence; fall back gracefully
+      const constraints: MediaStreamConstraints = {
+        video: {
+          facingMode: useFront ? 'user' : { exact: 'environment' as const },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
         audio: false,
-      })
+      }
+
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints)
+      } catch {
+        // Some devices don’t support exact: 'environment' — fall back to default
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+      }
+      currentStream.current = stream
 
       const v = videoRef.current!
       const c = canvasRef.current!
@@ -70,7 +87,6 @@ export default function CameraCanvas() {
       const loop = () => {
         const now = performance.now()
         const dt = now - last
-        // Local FPS for drawing; also update state for the small label under the canvas
         const fpsNow = dt > 0 ? 1000 / dt : 0
         setFps(fpsNow)
         last = now
@@ -85,10 +101,15 @@ export default function CameraCanvas() {
         c.height = v.videoHeight
         g.clearRect(0, 0, c.width, c.height)
 
+        // === DRAW OVERLAY ===
+        // NOTE: we are NOT drawing the video onto the canvas; the <video> sits behind.
+        // If the <video> is mirrored via CSS, we also mirror the <canvas> element itself
+        // (via CSS transform below) so overlay matches.
         if (res && res.keypoints.length) {
           const kps = res.keypoints
+          const VIS = 0.2 // lower vis threshold a bit for stability
 
-          // --- Side-profile guard: require one side clearly visible ---
+          // Side-profile guard: one side must be clearly visible
           const leftSideOK =
             (kps[KP.LEFT_HIP].visibility ?? 0) > 0.6 &&
             (kps[KP.LEFT_KNEE].visibility ?? 0) > 0.6 &&
@@ -99,29 +120,30 @@ export default function CameraCanvas() {
             (kps[KP.RIGHT_ANKLE].visibility ?? 0) > 0.6
           const profileOK = leftSideOK || rightSideOK
 
-          // Draw bones/joints
+          // Bones
           g.lineWidth = 3
           g.globalAlpha = 0.9
           g.strokeStyle = '#ffffff'
           EDGES.forEach(([a, b]) => {
             const p = kps[a]; const q = kps[b]
-            if ((p?.visibility ?? 0) > 0.3 && (q?.visibility ?? 0) > 0.3) {
+            if ((p?.visibility ?? 0) > VIS && (q?.visibility ?? 0) > VIS) {
               g.beginPath()
               g.moveTo(p.x * c.width, p.y * c.height)
               g.lineTo(q.x * c.width, q.y * c.height)
               g.stroke()
             }
           })
+          // Joints
           g.fillStyle = '#ffffff'
           kps.forEach((pt) => {
-            if ((pt.visibility ?? 0) > 0.3) {
+            if ((pt.visibility ?? 0) > VIS) {
               g.beginPath()
               g.arc(pt.x * c.width, pt.y * c.height, 4, 0, Math.PI * 2)
               g.fill()
             }
           })
 
-          // --- Angles (smoothed) ---
+          // Angles
           const lKnee = angleABC(
             { x: kps[KP.LEFT_HIP].x, y: kps[KP.LEFT_HIP].y },
             { x: kps[KP.LEFT_KNEE].x, y: kps[KP.LEFT_KNEE].y },
@@ -148,20 +170,17 @@ export default function CameraCanvas() {
           trunkSmoothed = ema(trunkSmoothed, trunk)
           setTrunkDeg(Math.round(trunkSmoothed!))
 
-          // --- Depth with margin + temporal gating ---
-          const depthMargin = 0.02 // be below knee by a small margin
+          // Depth with margin + temporal gating
+          const depthMargin = 0.02 // require hip below knee by a bit
           const lDepthNow = kps[KP.LEFT_HIP].y > kps[KP.LEFT_KNEE].y + depthMargin
           const rDepthNow = kps[KP.RIGHT_HIP].y > kps[KP.RIGHT_KNEE].y + depthMargin
           const depthNow = lDepthNow && rDepthNow
           const depthOKSmoothed = depthGate.push(depthNow)
 
-          // --- FSM and transitions ---
+          // FSM & transitions
           const prevState: State = fsm.state
-          const prevReps = fsm.reps
           fsm = stepFSM(fsm, hipC.y, depthOKSmoothed)
           setReps(fsm.reps)
-
-          // New rep started → reset gate + rep cue memory
           if (prevState === 'lockout' && fsm.state === 'descent') {
             depthGate.reset()
             spokeCueTypeThisRep = null
@@ -182,14 +201,14 @@ export default function CameraCanvas() {
             }
           }
 
-          // HUD (use fpsNow here; not the state 'fps' to avoid deps)
+          // Debug HUD on canvas
           g.fillStyle = profileOK ? '#ffffff' : '#ff7070'
           g.font = '16px system-ui'
           g.fillText(`FPS ${Math.round(fpsNow)}`, 10, 20)
           g.fillText(`Knee ${Math.round(kneeSmoothed || knee)}°`, 10, 40)
           g.fillText(`Trunk ${Math.round(trunkSmoothed || trunk)}°`, 10, 60)
           g.fillText(`Reps ${fsm.reps} | State ${fsm.state}`, 10, 80)
-          if (!profileOK) g.fillText('Tip: turn side-on to camera', 10, 100)
+          if (!profileOK) g.fillText('Tip: side-on; show hips-knees-ankles', 10, 100)
         }
 
         raf = requestAnimationFrame(loop)
@@ -199,31 +218,44 @@ export default function CameraCanvas() {
     }
 
     start().catch(console.error)
-    return () => cancelAnimationFrame(raf)
-  // Only depend on TTS enable/speak so the loop restarts if that changes.
-  }, [enabled, speak])
+    return () => {
+      cancelAnimationFrame(raf)
+      if (currentStream.current) currentStream.current.getTracks().forEach(t => t.stop())
+    }
+  // restart loop when TTS or camera selection changes
+  }, [enabled, speak, useFront])
 
   return (
-    <div style={{ maxWidth: 420, marginInline: 'auto', position: 'relative' }}>
-      {!enabled && (
-        <button
-          onClick={enable}
-          style={{ padding: '8px 12px', borderRadius: 12, border: '1px solid #444', marginBottom: 12 }}
-        >
-          Enable Coaching Audio
+    <div style={{ maxWidth: 460, marginInline: 'auto' }}>
+      {/* Controls */}
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginBottom: 12 }}>
+        <button onClick={() => setUseFront(v => !v)} style={{ padding: '6px 10px', border: '1px solid #444', borderRadius: 10 }}>
+          {useFront ? 'Switch to Rear Camera' : 'Switch to Front Camera'}
         </button>
-      )}
+        {!enabled && (
+          <button onClick={enable} style={{ padding: '6px 10px', border: '1px solid #444', borderRadius: 10 }}>
+            Enable Coaching Audio
+          </button>
+        )}
+      </div>
+
       {camError && (
         <div style={{ color: '#f33', marginBottom: 12, fontSize: 14 }}>{camError}</div>
       )}
-      <div style={{ position: 'relative' }}>
+
+      {/* Mirror both video and canvas together when using front camera */}
+      <div style={{
+        position: 'relative',
+        transform: mirror ? 'scaleX(-1)' as const : 'none'
+      }}>
         <video ref={videoRef} className="w-full rounded-2xl" playsInline muted />
         <canvas ref={canvasRef} className="w-full h-full absolute inset-0 pointer-events-none" />
       </div>
+
+      {/* simple label under the canvas (unmirrored) */}
       <div className="text-xs opacity-70 mt-2">
         FPS: {fps.toFixed(1)} | Reps: {reps} | Knee: {kneeDeg ?? '-'}° | Trunk: {trunkDeg ?? '-'}°
       </div>
     </div>
   )
 }
-
