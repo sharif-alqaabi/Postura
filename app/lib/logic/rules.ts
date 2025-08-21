@@ -1,16 +1,23 @@
-// Simple rules → spoken cues
+// Spoken cues produced at the *bottom* of the rep.
 export interface Cue {
     type: 'depth' | 'trunk' | 'knee'
     message: string
   }
   
-  export function checkRules(kneeDeg: number | null, trunkDeg: number | null): Cue[] {
+  export function checkRulesAtBottom(opts: {
+    depthOK: boolean
+    trunkDeg: number | null
+    trunkThreshold?: number
+  }): Cue[] {
+    const { depthOK, trunkDeg, trunkThreshold = 35 } = opts
     const cues: Cue[] = []
-    // If knee angle is too open (i.e., you didn’t get deep), nudge depth
-    if (kneeDeg != null && kneeDeg > 140) cues.push({ type: 'depth', message: 'Go deeper' })
-    // If torso leans too far from vertical, nudge posture
-    if (trunkDeg != null && trunkDeg > 35) cues.push({ type: 'trunk', message: 'Chest up' })
-    // (We’ll add knees-in later when we compute ankle/knee spread)
+  
+    // Only say "Go deeper" if depth was NOT achieved for this rep.
+    if (!depthOK) cues.push({ type: 'depth', message: 'Go deeper' })
+    if (trunkDeg != null && trunkDeg > trunkThreshold) {
+      cues.push({ type: 'trunk', message: 'Chest up' })
+    }
+    // (Knees-in will come later when we compute knee/ankle spread)
     return cues
   }
   
