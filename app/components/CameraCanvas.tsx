@@ -1,34 +1,50 @@
-'use client';
+'use client'
 import { useEffect, useRef, useState } from 'react'
 import { initPose, detectPose, isReady } from '@/app/lib/pose/loader'
 import { EDGES, KP } from '@/app/lib/pose/topology'
 import { angleABC, trunkAngle, ema } from '@/app/lib/math/angles'
 import { createFSM, stepFSM } from '@/app/lib/logic/fsm'
+import { useTTS } from '@/app/lib/audio/useTTS'
+import { checkRules } from '@/app/lib/logic/rules'
 
 /**
- * Renders:
- * - Skeleton lines and joints
- * - Knee and trunk angles (smoothed)
- * - Rep counter via FSM
+ * Camera + overlay + angles + rep FSM + TTS cues
+ * - Click "Enable Coaching Audio" once to allow speech (browser policy).
+ * - We only speak at most one cue every ~1.2s (useTTS handles gap).
+ * - We also avoid repeating the same cue twice in the same rep.
  */
 export default function CameraCanvas() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+
   const [fps, setFps] = useState(0)
   const [kneeDeg, setKneeDeg] = useState<number | null>(null)
   const [trunkDeg, setTrunkDeg] = useState<number | null>(null)
   const [reps, setReps] = useState(0)
 
+  // TTS hook: enable() must be called by a user gesture
+  const { enabled, enable, speak } = useTTS(1200)
+
   useEffect(() => {
     let raf = 0
     let last = performance.now()
+
+    // smoothing accumulators
     let kneeSmoothed: number | null = null
     let trunkSmoothed: number | null = null
+
+    // rep state
     let fsm = createFSM()
+
+    // simple anti-spam: remember which cue we already spoke this rep
+    let spokeCueTypeThisRep: null | 'depth' | 'trunk' | 'knee' = null
 
     async function start() {
       await initPose()
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' },
+        audio: false,
+      })
       const v = videoRef.current!
       const c = canvasRef.current!
       const g = c.getContext('2d')!
@@ -41,9 +57,13 @@ export default function CameraCanvas() {
         if (dt > 0) setFps(1000 / dt)
         last = now
 
-        if (!isReady()) { raf = requestAnimationFrame(loop); return }
+        if (!isReady()) {
+          raf = requestAnimationFrame(loop)
+          return
+        }
         const res = detectPose(v, now)
 
+        // canvas sizing + clear
         c.width = v.videoWidth
         c.height = v.videoHeight
         g.clearRect(0, 0, c.width, c.height)
@@ -51,7 +71,7 @@ export default function CameraCanvas() {
         if (res && res.keypoints.length) {
           const kps = res.keypoints
 
-          // 1) Draw bones (only if both endpoints are confident)
+          // draw bones
           g.lineWidth = 3
           g.globalAlpha = 0.9
           g.strokeStyle = '#ffffff'
@@ -64,8 +84,7 @@ export default function CameraCanvas() {
               g.stroke()
             }
           })
-
-          // 2) Draw joints
+          // draw joints
           g.fillStyle = '#ffffff'
           kps.forEach((pt) => {
             if ((pt.visibility ?? 0) > 0.3) {
@@ -75,7 +94,7 @@ export default function CameraCanvas() {
             }
           })
 
-          // 3) Angles: average knee angle, and trunk lean
+          // angles
           const leftKnee = angleABC(
             { x: kps[KP.LEFT_HIP].x, y: kps[KP.LEFT_HIP].y },
             { x: kps[KP.LEFT_KNEE].x, y: kps[KP.LEFT_KNEE].y },
@@ -102,22 +121,38 @@ export default function CameraCanvas() {
           trunkSmoothed = ema(trunkSmoothed, trunk)
           setTrunkDeg(Math.round(trunkSmoothed!))
 
-          // 4) Depth heuristic: hip lower (greater y) than knee on both sides
+          // depth heuristic
           const lDepth = kps[KP.LEFT_HIP].y > kps[KP.LEFT_KNEE].y
           const rDepth = kps[KP.RIGHT_HIP].y > kps[KP.RIGHT_KNEE].y
           const depthOkay = lDepth && rDepth
 
-          // 5) FSM step using hip-center y as primary signal
+          // FSM step + rep tracking
+          const prevReps = fsm.reps
           fsm = stepFSM(fsm, hipC.y, depthOkay)
           setReps(fsm.reps)
 
-          // HUD text
+          // If we just completed a rep, clear per-rep spoken flag
+          if (fsm.reps !== prevReps) {
+            spokeCueTypeThisRep = null
+          }
+
+          // SPEAK CUES (one per ~1.2s; and not twice per rep)
+          const cues = checkRules(kneeSmoothed ?? knee, trunkSmoothed ?? trunk)
+          if (enabled && cues.length) {
+            const first = cues.find(c => c.type !== spokeCueTypeThisRep) || cues[0]
+            if (first.type !== spokeCueTypeThisRep) {
+              speak(first.message)
+              spokeCueTypeThisRep = first.type
+            }
+          }
+
+          // HUD
           g.fillStyle = '#ffffff'
           g.font = '16px system-ui'
           g.fillText(`FPS ${Math.round(fps)}`, 10, 20)
           g.fillText(`Knee ${Math.round(kneeSmoothed || knee)}°`, 10, 40)
           g.fillText(`Trunk ${Math.round(trunkSmoothed || trunk)}°`, 10, 60)
-          g.fillText(`Reps ${fsm.reps}  | State ${fsm.state}`, 10, 80)
+          g.fillText(`Reps ${fsm.reps} | State ${fsm.state}`, 10, 80)
         }
 
         raf = requestAnimationFrame(loop)
@@ -128,10 +163,20 @@ export default function CameraCanvas() {
 
     start().catch(console.error)
     return () => cancelAnimationFrame(raf)
-  }, [])
+  }, [enabled, speak]) // re-run loop if TTS state changes
 
   return (
     <div style={{ maxWidth: 420, marginInline: 'auto', position: 'relative' }}>
+      {/* Button is needed once to enable speech on iOS/Chrome */}
+      {!enabled && (
+        <button
+          onClick={enable}
+          style={{ padding: '8px 12px', borderRadius: 12, border: '1px solid #444', marginBottom: 12 }}
+        >
+          Enable Coaching Audio
+        </button>
+      )}
+
       <div style={{ position: 'relative' }}>
         <video ref={videoRef} className="w-full rounded-2xl" playsInline muted />
         <canvas ref={canvasRef} className="w-full h-full absolute inset-0 pointer-events-none" />
