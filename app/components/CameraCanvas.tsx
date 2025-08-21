@@ -7,47 +7,68 @@ import { createFSM, stepFSM, type State } from '@/app/lib/logic/fsm'
 import { useTTS } from '@/app/lib/audio/useTTS'
 import { TemporalGate } from '@/app/lib/logic/temporal'
 import { checkRulesAtBottom } from '@/app/lib/logic/rules'
+import { PoseSmoother } from '@/app/lib/pose/smoothing'
 
 /**
- * Camera + overlay + angles + rep FSM + bottom-only TTS cues
- * - Toggle front/rear camera; mirror overlay when using front camera
- * - Temporal gate for depth; cues only at bottom transition
- * - Side-profile guard to reduce false cues
- * - TTS enable + test button, and HUD shows last spoken cue
+ * Camera + overlay + angles + calibrated, normalized rep detection + bottom-only TTS cues
+ * with robust temporal smoothing (One-Euro + despike) for stable skeleton.
  */
 export default function CameraCanvas() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
+  // HUD
   const [fps, setFps] = useState(0)
   const [kneeDeg, setKneeDeg] = useState<number | null>(null)
   const [trunkDeg, setTrunkDeg] = useState<number | null>(null)
   const [reps, setReps] = useState(0)
   const [camError, setCamError] = useState<string | null>(null)
   const [lastCue, setLastCue] = useState<string | null>(null)
+  const [calibrated, setCalibrated] = useState(false)
 
-  // Camera + mirroring controls
-  const [useFront, setUseFront] = useState(true) // front/selfie by default
-  const mirror = useFront // mirror both video & canvas together when using front camera
+  // Camera controls
+  const [useFront, setUseFront] = useState(true)
+  const mirror = useFront
 
   // TTS (1.2s cooldown inside the hook)
   const { enabled, enable, speak, test } = useTTS(1200)
 
-  // Keep a handle to stop the previous stream when switching cameras
+  // Track current stream
   const currentStream = useRef<MediaStream | null>(null)
 
   useEffect(() => {
     let raf = 0
     let last = performance.now()
 
-    // Smoothing accumulators
+    // ----------- Smoothing & State -----------
+    const smoother = new PoseSmoother(1.2, 0.007, 1.0, 0.08, 0.15) // tuned defaults
     let kneeSmoothed: number | null = null
     let trunkSmoothed: number | null = null
 
-    // FSM + temporal gate
+    // FSM + temporal
     let fsm = createFSM()
-    const depthGate = new TemporalGate(6, 4) // require 4/6 recent frames at depth
+    const depthGate = new TemporalGate(6, 4)
     let spokeCueTypeThisRep: null | 'depth' | 'trunk' | 'knee' = null
+
+    // ----------- Calibration (lockout top + scale) -----------
+    const CALIB_FRAMES = 30
+    const topYBuf: number[] = []
+    const scaleBuf: number[] = []
+    let haveTop = false
+    let topY: number | null = null
+    let scale: number | null = null
+
+    // Guards to avoid rapid state flips
+    const MIN_TRANSITION_MS = 120
+    let lastTransitionAt = performance.now()
+
+    function median(arr: number[]) {
+      const a = [...arr].sort((x, y) => x - y)
+      const n = a.length
+      if (!n) return 0
+      const mid = Math.floor(n / 2)
+      return n % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2
+    }
 
     async function start() {
       await initPose()
@@ -82,7 +103,6 @@ export default function CameraCanvas() {
       try {
         stream = await navigator.mediaDevices.getUserMedia(constraints)
       } catch {
-        // Some devices don’t support exact: 'environment' — fall back to default
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
       }
       currentStream.current = stream
@@ -100,25 +120,21 @@ export default function CameraCanvas() {
         setFps(fpsNow)
         last = now
 
-        if (!isReady()) {
-          raf = requestAnimationFrame(loop)
-          return
-        }
+        if (!isReady()) { raf = requestAnimationFrame(loop); return }
         const res = detectPose(v, now)
 
         c.width = v.videoWidth
         c.height = v.videoHeight
         g.clearRect(0, 0, c.width, c.height)
 
-        // === DRAW OVERLAY ===
-        // NOTE: we are NOT drawing the video onto the canvas; the <video> sits behind.
-        // If the <video> is mirrored via CSS, we also mirror the <canvas> element itself
-        // (via CSS transform in JSX) so overlay matches.
         if (res && res.keypoints.length) {
-          const kps = res.keypoints
-          const VIS = 0.2 // lower vis threshold a bit for stability
+          // --- Smooth keypoints (time in seconds) ---
+          const timeSec = now / 1000
+          const kps = smoother.apply(res.keypoints, timeSec)
 
-          // Side-profile guard: one side must be clearly visible
+          const VIS = 0.2 // visibility threshold for drawing
+
+          // --- Side-profile guard: one side must be clearly visible ---
           const leftSideOK =
             (kps[KP.LEFT_HIP].visibility ?? 0) > 0.6 &&
             (kps[KP.LEFT_KNEE].visibility ?? 0) > 0.6 &&
@@ -129,9 +145,9 @@ export default function CameraCanvas() {
             (kps[KP.RIGHT_ANKLE].visibility ?? 0) > 0.6
           const profileOK = leftSideOK || rightSideOK
 
-          // Bones
+          // --- Draw bones & joints using smoothed points ---
           g.lineWidth = 3
-          g.globalAlpha = 0.9
+          g.globalAlpha = 0.95
           g.strokeStyle = '#ffffff'
           EDGES.forEach(([a, b]) => {
             const p = kps[a]; const q = kps[b]
@@ -142,7 +158,6 @@ export default function CameraCanvas() {
               g.stroke()
             }
           })
-          // Joints
           g.fillStyle = '#ffffff'
           kps.forEach((pt) => {
             if ((pt.visibility ?? 0) > VIS) {
@@ -152,7 +167,20 @@ export default function CameraCanvas() {
             }
           })
 
-          // Angles
+          // --- Centers & smoothed angles ---
+          const hipC = {
+            x: (kps[KP.LEFT_HIP].x + kps[KP.RIGHT_HIP].x) / 2,
+            y: (kps[KP.LEFT_HIP].y + kps[KP.RIGHT_HIP].y) / 2,
+          }
+          const shC = {
+            x: (kps[KP.LEFT_SHOULDER].x + kps[KP.RIGHT_SHOULDER].x) / 2,
+            y: (kps[KP.LEFT_SHOULDER].y + kps[KP.RIGHT_SHOULDER].y) / 2,
+          }
+          const anC = {
+            x: (kps[KP.LEFT_ANKLE].x + kps[KP.RIGHT_ANKLE].x) / 2,
+            y: (kps[KP.LEFT_ANKLE].y + kps[KP.RIGHT_ANKLE].y) / 2,
+          }
+
           const lKnee = angleABC(
             { x: kps[KP.LEFT_HIP].x, y: kps[KP.LEFT_HIP].y },
             { x: kps[KP.LEFT_KNEE].x, y: kps[KP.LEFT_KNEE].y },
@@ -167,29 +195,62 @@ export default function CameraCanvas() {
           kneeSmoothed = ema(kneeSmoothed, knee)
           setKneeDeg(Math.round(kneeSmoothed!))
 
-          const hipC = {
-            x: (kps[KP.LEFT_HIP].x + kps[KP.RIGHT_HIP].x) / 2,
-            y: (kps[KP.LEFT_HIP].y + kps[KP.RIGHT_HIP].y) / 2,
-          }
-          const shC = {
-            x: (kps[KP.LEFT_SHOULDER].x + kps[KP.RIGHT_SHOULDER].x) / 2,
-            y: (kps[KP.LEFT_SHOULDER].y + kps[KP.RIGHT_SHOULDER].y) / 2,
-          }
           const trunk = trunkAngle(hipC, shC)
           trunkSmoothed = ema(trunkSmoothed, trunk)
           setTrunkDeg(Math.round(trunkSmoothed!))
 
-          // Depth with margin + temporal gating
-          const depthMargin = 0.02 // require hip below knee by a bit
-          const lDepthNow = kps[KP.LEFT_HIP].y > kps[KP.LEFT_KNEE].y + depthMargin
-          const rDepthNow = kps[KP.RIGHT_HIP].y > kps[KP.RIGHT_KNEE].y + depthMargin
-          const depthNow = lDepthNow && rDepthNow
-          const depthOKSmoothed = depthGate.push(depthNow)
+          // --- Calibration (stand tall to capture topY + scale) ---
+          const nowHipY = hipC.y
+          ;(loop as any)._lastHipY = (loop as any)._lastHipY ?? nowHipY
+          const vy = nowHipY - (loop as any)._lastHipY
+          ;(loop as any)._lastHipY = nowHipY
 
-          // FSM & transitions
+          const uprightKnees = (kneeSmoothed ?? knee) >= 165
+          const uprightTrunk = (trunkSmoothed ?? trunk) <= 15
+          const still = Math.abs(vy) < 0.002
+
+          if (!haveTop && uprightKnees && uprightTrunk && still && profileOK) {
+            topYBuf.push(nowHipY)
+            scaleBuf.push(Math.max(0.05, shC.y - anC.y)) // shoulder->ankle span
+            if (topYBuf.length >= CALIB_FRAMES) {
+              topY = median(topYBuf)
+              scale = median(scaleBuf)
+              haveTop = true
+              setCalibrated(true)
+            }
+          }
+
+          if (!haveTop || !topY || !scale) {
+            g.fillStyle = '#ffdb6e'
+            g.font = '16px system-ui'
+            g.fillText('Stand tall to calibrate…', 10, 24)
+            g.fillText('Tips: side-on, full body, good light', 10, 44)
+            raf = requestAnimationFrame(loop); return
+          }
+
+          // --- Normalized depth & gating ---
+          const depth = Math.max(0, Math.min(1, (nowHipY - topY) / (scale || 1e-3)))
+          ;(loop as any)._depthPrev = (loop as any)._depthPrev ?? depth
+          const depthPrev = (loop as any)._depthPrev as number
+          ;(loop as any)._depthPrev = depth
+
+          const DEPTH_MARGIN = 0.03
+          const TARGET_DEPTH = 0.33
+          const atDepthNow = depth > (TARGET_DEPTH + DEPTH_MARGIN)
+          const depthOKSmoothed = depthGate.push(atDepthNow)
+
+          // --- FSM with small hysteresis on transitions ---
           const prevState: State = fsm.state
-          fsm = stepFSM(fsm, hipC.y, depthOKSmoothed)
-          setReps(fsm.reps)
+          const nowMs = performance.now()
+          const MIN_TRANSITION_MS = 120
+          const canTransition = (nowMs - lastTransitionAt) > MIN_TRANSITION_MS
+          if (canTransition) {
+            const next = stepFSM(fsm, depth, depthOKSmoothed)
+            if (next.state !== fsm.state) lastTransitionAt = nowMs
+            fsm = next
+            setReps(fsm.reps)
+          }
+
           if (prevState === 'lockout' && fsm.state === 'descent') {
             depthGate.reset()
             spokeCueTypeThisRep = null
@@ -206,19 +267,20 @@ export default function CameraCanvas() {
             const first = cues.find(c => c.type !== spokeCueTypeThisRep)
             if (first) {
               speak(first.message)
-              setLastCue(first.message) // show in HUD in case audio is blocked
+              setLastCue(first.message)
               spokeCueTypeThisRep = first.type
             }
           }
 
-          // Debug HUD on canvas
+          // --- HUD ---
           g.fillStyle = profileOK ? '#ffffff' : '#ff7070'
           g.font = '16px system-ui'
           g.fillText(`FPS ${Math.round(fpsNow)}`, 10, 20)
           g.fillText(`Knee ${Math.round(kneeSmoothed || knee)}°`, 10, 40)
           g.fillText(`Trunk ${Math.round(trunkSmoothed || trunk)}°`, 10, 60)
           g.fillText(`Reps ${fsm.reps} | State ${fsm.state}`, 10, 80)
-          if (!profileOK) g.fillText('Tip: side-on; show hips-knees-ankles', 10, 100)
+          g.fillText(`Depth ${(depth * 100).toFixed(0)}%`, 10, 100)
+          if (!profileOK) g.fillText('Tip: side-on; show hips-knees-ankles', 10, 120)
         }
 
         raf = requestAnimationFrame(loop)
@@ -232,11 +294,10 @@ export default function CameraCanvas() {
       cancelAnimationFrame(raf)
       if (currentStream.current) currentStream.current.getTracks().forEach(t => t.stop())
     }
-    // restart loop when TTS or camera selection changes
   }, [enabled, speak, useFront])
 
   return (
-    <div style={{ maxWidth: 460, marginInline: 'auto' }}>
+    <div style={{ maxWidth: 480, marginInline: 'auto' }}>
       {/* Controls */}
       <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
         <button
@@ -273,9 +334,9 @@ export default function CameraCanvas() {
         <canvas ref={canvasRef} className="w-full h-full absolute inset-0 pointer-events-none" />
       </div>
 
-      {/* simple label under the canvas (unmirrored) */}
+      {/* Label under the canvas */}
       <div className="text-xs opacity-70 mt-2">
-        FPS: {fps.toFixed(1)} | Reps: {reps} | Knee: {kneeDeg ?? '-'}° | Trunk: {trunkDeg ?? '-'}°
+        {calibrated ? 'Calibrated' : 'Stand tall to calibrate…'} | FPS: {fps.toFixed(1)} | Reps: {reps} | Knee: {kneeDeg ?? '-'}° | Trunk: {trunkDeg ?? '-'}°
         {lastCue ? <> | Last cue: <strong>{lastCue}</strong></> : null}
       </div>
     </div>
