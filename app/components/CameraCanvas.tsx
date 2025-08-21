@@ -10,13 +10,12 @@ import { checkRulesAtBottom } from '@/app/lib/logic/rules'
 import { PoseSmoother } from '@/app/lib/pose/smoothing'
 
 /**
- * Depth logic keyed to knee ≤ 50° (coaching), and knee ≤ 70° (rep counting).
- * - Monotonic depthFSM = max(hipDepth, kneeDepth) for stable FSM.
- * - Coaching + rep have separate (stricter vs easier) thresholds.
- * - Knee-depth normalization: 180° -> 0, 50° -> 1.
- * - Hip-depth equivalents tuned to match (rep≈0.45, coach≈0.52).
- * - Turnaround detector + dwell + hysteresis to avoid random counts.
- * - Trunk cue uses delta vs upright baseline for reliable “Chest up”.
+ * EXACT RULES:
+ * - Rep counts only when KNEE ≤ 65° (with temporal gating & hysteresis).
+ * - Until KNEE ≤ 60°, the coach says "Go deeper".
+ * - We drive the FSM with a monotonic knee-depth metric for stability.
+ * - Turnaround detector + dwell to prevent random rep bumps.
+ * - "Chest up" still uses trunk delta vs upright baseline (tilt-safe).
  */
 export default function CameraCanvas() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -28,91 +27,63 @@ export default function CameraCanvas() {
   const [trunkDeg, setTrunkDeg] = useState<number | null>(null)
   const [reps, setReps] = useState(0)
   const [camError, setCamError] = useState<string | null>(null)
-  const [lastCue, setLastCue] = useState<string | null>(null)
   const [calibrated, setCalibrated] = useState(false)
+  const [lastCue, setLastCue] = useState<string | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
+
+  // Debug line so you can see why it did/didn't count/speak
   const [dbg, setDbg] = useState<{
-    repOK: boolean; coachOK: boolean; trunkDelta: number;
-    knee: number; depthHip: number; depthKnee: number; depthFSM: number;
-    vel: number; turn: boolean;
-  }>({repOK:false, coachOK:false, trunkDelta:0, knee:0, depthHip:0, depthKnee:0, depthFSM:0, vel:0, turn:false})
+    knee: number; kneeDepth: number; depthFSM: number;
+    repOK: boolean; coachOK: boolean; vel: number; turn: boolean
+  }>({ knee: 999, kneeDepth: 0, depthFSM: 0, repOK: false, coachOK: false, vel: 0, turn: false })
 
   // Camera controls
   const [useFront, setUseFront] = useState(true)
   const mirror = useFront
 
-  // ---- Thresholds aligned to knee 50° target ----
-  // Rep counting (easier)
-  const REP_KNEE_DEG   = 70;   // knee ≤ 70° counts as deep enough for reps
-  const REP_HIP_DEPTH  = 0.45; // equivalent hip-depth
-  // Coaching (stricter)
-  const COACH_KNEE_DEG = 50;   // knee ≤ 50° is the coaching "good depth"
-  const COACH_HIP_DEPTH= 0.52; // equivalent hip-depth
-  // Dwell & hysteresis
-  const GATE_WINDOW = 8, GATE_NEED = 6; // ≈130ms @60fps
-  const DWELL_FRAMES = 5;               // frames coachOK must persist
-  const MIN_TRANSITION_MS = 140;
+  // === Your exact thresholds ===
+  const REP_KNEE_DEG = 65    // count a rep when knee ≤ 65°
+  const COACH_KNEE_DEG = 60  // say "Go deeper" until knee ≤ 60°
+
+  // Temporal gates / hysteresis
+  const GATE_WINDOW = 10, GATE_NEED = 7   // slightly stricter to remove bounce
+  const MIN_TRANSITION_MS = 160           // hysteresis between FSM transitions
+  const COACH_DWELL_FRAMES = 5            // coachOK must persist this long
 
   // TTS
   const { enabled, enable, speak, test } = useTTS(1200)
 
-  // Stream + loop state
+  // Loop state (no 'any')
   const currentStream = useRef<MediaStream | null>(null)
-  const lastHipYRef = useRef<number | null>(null)
+  const lastTransitionAtRef = useRef<number>(0)
   const prevDepthFSMRef = useRef<number | null>(null)
   const prevVelRef = useRef<number | null>(null)
-  const lastTransitionAtRef = useRef<number>(0)
 
-  // Learned (auto-tuned) coaching targets (start near our defaults, clamp around new spec)
-  const learnedCoachHipRef = useRef<number | null>(null)
-  const learnedCoachKneeRef = useRef<number | null>(null)
-  const goodBottomHip: number[] = []
-  const goodBottomKnee: number[] = []
-
-  // Upright trunk baseline (deg) learned during calibration
+  // Calibration for trunk baseline (tilt-safe chest cue)
   const trunkBaselineRef = useRef<number | null>(null)
 
   useEffect(() => {
     let raf = 0
     let last = performance.now()
 
-    // -------- Smoothing --------
+    // --- Smoothing ---
     const smoother = new PoseSmoother(1.4, 0.006, 1.0, 0.07, 0.15)
     let kneeSmoothed: number | null = null
     let trunkSmoothed: number | null = null
 
-    // -------- FSM & Gates --------
+    // --- FSM & Gates ---
     let fsm = createFSM()
     const repGate = new TemporalGate(GATE_WINDOW, GATE_NEED)
     const coachGate = new TemporalGate(GATE_WINDOW, GATE_NEED)
     let coachConsec = 0
     let spokeCueTypeThisRep: null | 'depth' | 'trunk' | 'knee' = null
 
-    // -------- Calibration (top, scale, trunk baseline) --------
-    const CALIB_FRAMES = 90 // ~1.5s @60fps
-    const topYBuf: number[] = []
-    const scaleBuf: number[] = []
+    // --- Calibration (upright trunk baseline only) ---
+    const CALIB_FRAMES = 60 // ~1s @60fps
     const trunkBaseBuf: number[] = []
-    const hipYWindow: number[] = []
-    let haveTop = false
-    let topY: number | null = null
-    let scale: number | null = null
+    let calibDone = false
 
-    function median(arr: number[]) {
-      const a = [...arr].sort((x, y) => x - y)
-      const n = a.length
-      if (!n) return 0
-      const mid = Math.floor(n / 2)
-      return n % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2
-    }
-    function stddev(arr: number[]) {
-      const n = arr.length
-      if (n < 2) return 0
-      const m = arr.reduce((s,v)=>s+v,0)/n
-      const v = arr.reduce((s,v)=>s+(v-m)*(v-m),0)/(n-1)
-      return Math.sqrt(v)
-    }
-    function clamp01(x:number){ return Math.max(0, Math.min(1, x)) }
+    function clamp01(x: number) { return Math.max(0, Math.min(1, x)) }
 
     async function start() {
       await initPose()
@@ -120,7 +91,6 @@ export default function CameraCanvas() {
         currentStream.current.getTracks().forEach(t => t.stop())
         currentStream.current = null
       }
-
       if (
         typeof navigator === 'undefined' ||
         !navigator.mediaDevices ||
@@ -140,11 +110,8 @@ export default function CameraCanvas() {
       }
 
       let stream: MediaStream
-      try {
-        stream = await navigator.mediaDevices.getUserMedia(constraints)
-      } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-      }
+      try { stream = await navigator.mediaDevices.getUserMedia(constraints) }
+      catch { stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }) }
       currentStream.current = stream
 
       const v = videoRef.current!
@@ -153,7 +120,6 @@ export default function CameraCanvas() {
       v.srcObject = stream
       await v.play()
 
-      // Init
       lastTransitionAtRef.current = performance.now()
 
       const loop = () => {
@@ -171,12 +137,11 @@ export default function CameraCanvas() {
         g.clearRect(0, 0, c.width, c.height)
 
         if (res && res.keypoints.length) {
-          // --- Smooth keypoints ---
           const timeSec = now / 1000
           const kps = smoother.apply(res.keypoints, timeSec)
           const VIS = 0.2
 
-          // Side-profile guard (hip+knee visibility required; ankles may be hidden)
+          // Require hips+knees on at least one side (ankles can be occluded)
           const leftSideOK =
             (kps[KP.LEFT_HIP].visibility ?? 0) > 0.55 &&
             (kps[KP.LEFT_KNEE].visibility ?? 0) > 0.55
@@ -216,14 +181,6 @@ export default function CameraCanvas() {
             x: (kps[KP.LEFT_SHOULDER].x + kps[KP.RIGHT_SHOULDER].x) / 2,
             y: (kps[KP.LEFT_SHOULDER].y + kps[KP.RIGHT_SHOULDER].y) / 2,
           }
-          const ankVis =
-            (kps[KP.LEFT_ANKLE].visibility ?? 0) > 0.45 &&
-            (kps[KP.RIGHT_ANKLE].visibility ?? 0) > 0.45
-          const anC = {
-            x: (kps[KP.LEFT_ANKLE].x + kps[KP.RIGHT_ANKLE].x) / 2,
-            y: (kps[KP.LEFT_ANKLE].y + kps[KP.RIGHT_ANKLE].y) / 2,
-          }
-          const kneeC = { y: (kps[KP.LEFT_KNEE].y + kps[KP.RIGHT_KNEE].y) / 2 }
 
           const lKnee = angleABC(
             { x: kps[KP.LEFT_HIP].x, y: kps[KP.LEFT_HIP].y },
@@ -240,57 +197,39 @@ export default function CameraCanvas() {
           const kneeNow = kneeSmoothed ?? knee
           setKneeDeg(Math.round(kneeNow))
 
-          const trunk = trunkAngle(hipC, shC) // absolute vs vertical
+          const trunk = trunkAngle(hipC, shC) // angle vs vertical
           trunkSmoothed = ema(trunkSmoothed, trunk)
           const trunkNow = trunkSmoothed ?? trunk
           setTrunkDeg(Math.round(trunkNow))
 
-          // ---- Calibration (top, scale, trunk baseline) ----
-          const nowHipY = hipC.y
-          const prevHipY = lastHipYRef.current ?? nowHipY
-          lastHipYRef.current = nowHipY
-
-          hipYWindow.push(nowHipY)
-          if (hipYWindow.length > 20) hipYWindow.shift()
-          const still = stddev(hipYWindow) < 0.0009
-
-          const scaleCandidate = ankVis
-            ? Math.max(0.05, shC.y - anC.y)              // shoulder->ankle span
-            : Math.max(0.05, hipC.y - kneeC.y) * 1.8     // fallback if ankles hidden
-
-          const uprightKnees = kneeNow >= 170
-          const uprightTrunk = trunkNow <= 12
-
-          if (!haveTop && uprightKnees && uprightTrunk && still && profileOK) {
-            topYBuf.push(nowHipY)
-            scaleBuf.push(scaleCandidate)
+          // --- Upright trunk baseline calibration (simple & robust) ---
+          if (!calibDone && kneeNow >= 170 && trunkNow <= 12 && profileOK) {
             trunkBaseBuf.push(trunkNow)
-            if (topYBuf.length >= CALIB_FRAMES) {
-              topY = median(topYBuf)
-              scale = median(scaleBuf)
-              trunkBaselineRef.current = median(trunkBaseBuf)
-              haveTop = true
+            if (trunkBaseBuf.length >= CALIB_FRAMES) {
+              // median
+              const sorted = [...trunkBaseBuf].sort((a, b) => a - b)
+              const mid = Math.floor(sorted.length / 2)
+              trunkBaselineRef.current = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+              calibDone = true
               setCalibrated(true)
             }
           }
 
-          if (!haveTop || !topY || !scale) {
+          if (!calibDone) {
             g.fillStyle = '#ffdb6e'
             g.font = '16px system-ui'
             g.fillText('Stand tall to calibrate…', 10, 24)
-            g.fillText('Tips: side-on, full body, good light', 10, 44)
+            g.fillText('Tips: side-on, good light', 10, 44)
             raf = requestAnimationFrame(loop); return
           }
 
-          // ---- Depth metrics ----
-          // Hip-based normalized depth (0=top, 1=deep)
-          const depthHip = clamp01((nowHipY - topY) / (scale || 1e-3))
-          // Knee-based depth: 180° (top) -> 0, 50° (target deep) -> 1
-          const depthKnee = clamp01((180 - kneeNow) / (180 - 50))
-          // Monotonic driver for FSM
-          const depthFSM = Math.max(depthHip, depthKnee)
+          // --- Knee-only depth metric ---
+          // Map knee 180° (top) -> 0, 60° (coach OK) -> 1
+          const kneeDepth = clamp01((180 - kneeNow) / (180 - COACH_KNEE_DEG))
+          // Use kneeDepth as the monotonic FSM driver
+          const depthFSM = kneeDepth
 
-          // Velocity & turnaround on FSM depth
+          // Velocity / turnaround (down → up)
           const prevDepthFSM = prevDepthFSMRef.current ?? depthFSM
           prevDepthFSMRef.current = depthFSM
           const vel = depthFSM - prevDepthFSM
@@ -298,18 +237,13 @@ export default function CameraCanvas() {
           prevVelRef.current = vel
           const bottomTurn = (prevVel > 0.003) && (vel <= 0.0008)
 
-          // REP gating: knee or hip depth (easier)
-          const repOKNow = (kneeNow <= REP_KNEE_DEG) || (depthHip >= REP_HIP_DEPTH)
-          const repOK = repGate.push(repOKNow)
-
-          // COACH gating: knee or hip depth (stricter)
-          const coachKneeTarget = learnedCoachKneeRef.current ?? COACH_KNEE_DEG
-          const coachHipTarget  = learnedCoachHipRef.current  ?? COACH_HIP_DEPTH
-          const coachOKNow = (kneeNow <= coachKneeTarget) || (depthHip >= coachHipTarget)
+          // Gates: EXACT RULES
+          const repOK = repGate.push(kneeNow <= REP_KNEE_DEG)
+          const coachOKNow = (kneeNow <= COACH_KNEE_DEG)
           const coachOK = coachGate.push(coachOKNow)
           coachConsec = coachOKNow ? (coachConsec + 1) : 0
 
-          // FSM driven by depthFSM & repOK
+          // FSM driven by knee-depth + rep gate (prevents random rep counts)
           const prevState: State = fsm.state
           const nowMs = performance.now()
           const canTransition = (nowMs - lastTransitionAtRef.current) > MIN_TRANSITION_MS
@@ -320,19 +254,7 @@ export default function CameraCanvas() {
             setReps(fsm.reps)
           }
 
-          // Learn stricter coaching targets from early good bottoms (clamped around new spec)
-          const justHitBottom = prevState !== 'bottom' && fsm.state === 'bottom'
-          if (justHitBottom && repOK) {
-            goodBottomHip.push(depthHip)
-            goodBottomKnee.push(kneeNow)
-            if (goodBottomHip.length >= 2 && learnedCoachHipRef.current == null) {
-              const mHip = median(goodBottomHip)
-              const mKnee = median(goodBottomKnee)
-              learnedCoachHipRef.current  = Math.max(0.50, Math.min(0.65, mHip  - 0.01))
-              learnedCoachKneeRef.current = Math.max(50,   Math.min(75,   mKnee + 0))
-            }
-          }
-
+          // Reset gates & cue limiter on new rep
           if (prevState === 'lockout' && fsm.state === 'descent') {
             repGate.reset()
             coachGate.reset()
@@ -340,18 +262,21 @@ export default function CameraCanvas() {
             spokeCueTypeThisRep = null
           }
 
-          // Trunk delta vs upright baseline (compensates for phone tilt)
+          // Trunk delta vs upright baseline (tilt-safe)
           const trunkBase = trunkBaselineRef.current ?? 0
           const trunkDelta = Math.max(0, trunkNow - trunkBase)
 
-          // Evaluate cues at counted bottom OR shallow turnaround
+          // Evaluate cues either when we *enter bottom* or when we *turn around shallow*
+          const justHitBottom = prevState !== 'bottom' && fsm.state === 'bottom'
           const shouldEval = profileOK && (justHitBottom || bottomTurn)
+
           if (shouldEval) {
-            const depthAchieved = coachOK && (coachConsec >= DWELL_FRAMES)
+            // Depth achieved only if KNEE ≤ 60° with dwell
+            const depthAchieved = coachOK && (coachConsec >= COACH_DWELL_FRAMES)
             const cues = checkRulesAtBottom({
-              depthAchieved,
-              trunkDeltaDeg: trunkDelta,
-              trunkDeltaThreshold: 16,
+              depthAchieved,                    // false → "Go deeper"
+              trunkDeltaDeg: trunkDelta,        // "Chest up" if big lean
+              trunkDeltaThreshold: 16
             })
             const first = cues.find(c => c.type !== spokeCueTypeThisRep)
             if (first) {
@@ -363,25 +288,23 @@ export default function CameraCanvas() {
             }
           }
 
-          // --- HUD & Debug ---
+          // HUD
           g.fillStyle = profileOK ? '#ffffff' : '#ff7070'
           g.font = '16px system-ui'
           g.fillText(`FPS ${Math.round(fpsNow)}`, 10, 20)
           g.fillText(`Knee ${Math.round(kneeNow)}°`, 10, 40)
           g.fillText(`Trunk ${Math.round(trunkNow)}°`, 10, 60)
           g.fillText(`Reps ${fsm.reps} | State ${fsm.state}`, 10, 80)
-          g.fillText(`DepthHip ${(depthHip*100).toFixed(0)}%`, 10, 100)
-          g.fillText(`DepthKnee ${(depthKnee*100).toFixed(0)}%`, 10, 120)
+          g.fillText(`KneeDepth ${(kneeDepth*100).toFixed(0)}%`, 10, 100)
 
           setDbg({
-            repOK, coachOK,
-            trunkDelta: Math.round(trunkDelta),
             knee: Math.round(kneeNow),
-            depthHip: Math.round(depthHip*100)/100,
-            depthKnee: Math.round(depthKnee*100)/100,
-            depthFSM: Math.round(Math.max(depthHip, depthKnee)*100)/100,
-            vel: Math.round( (depthFSM - (prevDepthFSMRef.current ?? depthFSM)) * 1000 )/1000,
-            turn: bottomTurn,
+            kneeDepth: Math.round(kneeDepth*100)/100,
+            depthFSM: Math.round(depthFSM*100)/100,
+            repOK,
+            coachOK,
+            vel: Math.round((depthFSM - (prevDepthFSMRef.current ?? depthFSM))*1000)/1000,
+            turn: bottomTurn
           })
         }
 
@@ -441,13 +364,7 @@ export default function CameraCanvas() {
         {calibrated ? 'Calibrated' : 'Stand tall to calibrate…'} | FPS: {fps.toFixed(1)} | Reps: {reps} | Knee: {kneeDeg ?? '-'}° | Trunk: {trunkDeg ?? '-'}°
         {lastCue ? <> | Last cue: <strong>{lastCue}</strong></> : null}
         <div className="mt-1">
-          Debug → repOK: {dbg.repOK ? '✓' : '✗'}
-          {' '}| coachOK: {dbg.coachOK ? '✓' : '✗'}
-          {' '}| knee: {dbg.knee}°
-          {' '}| hipDepth: {dbg.depthHip}
-          {' '}| kneeDepth: {dbg.depthKnee}
-          {' '}| depthFSM: {dbg.depthFSM}
-          {' '}| turn: {dbg.turn ? '✓' : '✗'}
+          Debug → knee: {dbg.knee}° | repOK: {dbg.repOK ? '✓' : '✗'} | coachOK(≤60°): {dbg.coachOK ? '✓' : '✗'} | depthFSM: {dbg.depthFSM} | turn: {dbg.turn ? '✓' : '✗'}
         </div>
       </div>
     </div>
