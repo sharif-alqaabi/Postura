@@ -33,8 +33,11 @@ export default function CameraCanvas() {
   // TTS (1.2s cooldown inside the hook)
   const { enabled, enable, speak, test } = useTTS(1200)
 
-  // Track current stream
+  // Track current stream and some per-loop state without using `any`
   const currentStream = useRef<MediaStream | null>(null)
+  const lastHipYRef = useRef<number | null>(null)
+  const depthPrevRef = useRef<number | null>(null)
+  const lastTransitionAtRef = useRef<number>(0)
 
   useEffect(() => {
     let raf = 0
@@ -58,9 +61,9 @@ export default function CameraCanvas() {
     let topY: number | null = null
     let scale: number | null = null
 
-    // Guards to avoid rapid state flips
+    // Transition hysteresis
     const MIN_TRANSITION_MS = 120
-    let lastTransitionAt = performance.now()
+    lastTransitionAtRef.current = performance.now()
 
     function median(arr: number[]) {
       const a = [...arr].sort((x, y) => x - y)
@@ -201,9 +204,9 @@ export default function CameraCanvas() {
 
           // --- Calibration (stand tall to capture topY + scale) ---
           const nowHipY = hipC.y
-          ;(loop as any)._lastHipY = (loop as any)._lastHipY ?? nowHipY
-          const vy = nowHipY - (loop as any)._lastHipY
-          ;(loop as any)._lastHipY = nowHipY
+          const prevHipY = lastHipYRef.current ?? nowHipY
+          const vy = nowHipY - prevHipY
+          lastHipYRef.current = nowHipY
 
           const uprightKnees = (kneeSmoothed ?? knee) >= 165
           const uprightTrunk = (trunkSmoothed ?? trunk) <= 15
@@ -230,9 +233,8 @@ export default function CameraCanvas() {
 
           // --- Normalized depth & gating ---
           const depth = Math.max(0, Math.min(1, (nowHipY - topY) / (scale || 1e-3)))
-          ;(loop as any)._depthPrev = (loop as any)._depthPrev ?? depth
-          const depthPrev = (loop as any)._depthPrev as number
-          ;(loop as any)._depthPrev = depth
+          const prevDepth = depthPrevRef.current ?? depth
+          depthPrevRef.current = depth
 
           const DEPTH_MARGIN = 0.03
           const TARGET_DEPTH = 0.33
@@ -242,11 +244,10 @@ export default function CameraCanvas() {
           // --- FSM with small hysteresis on transitions ---
           const prevState: State = fsm.state
           const nowMs = performance.now()
-          const MIN_TRANSITION_MS = 120
-          const canTransition = (nowMs - lastTransitionAt) > MIN_TRANSITION_MS
+          const canTransition = (nowMs - lastTransitionAtRef.current) > MIN_TRANSITION_MS
           if (canTransition) {
             const next = stepFSM(fsm, depth, depthOKSmoothed)
-            if (next.state !== fsm.state) lastTransitionAt = nowMs
+            if (next.state !== fsm.state) lastTransitionAtRef.current = nowMs
             fsm = next
             setReps(fsm.reps)
           }
@@ -342,3 +343,4 @@ export default function CameraCanvas() {
     </div>
   )
 }
+

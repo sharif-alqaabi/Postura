@@ -28,13 +28,13 @@ export async function initPose(): Promise<void> {
 
   landmarker = await PoseLandmarker.createFromOptions(fileset, {
     baseOptions: {
-      // "lite" is fast; switch to "full" later on strong phones if needed.
+      // "lite" is fast; switch to "full" on strong phones if needed.
       modelAssetPath:
         'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
     },
     runningMode: 'VIDEO',
     numPoses: 1,
-    // Bump these a bit for fewer flickers
+    // Slightly stricter for fewer flickers
     minPoseDetectionConfidence: 0.6,
     minPosePresenceConfidence: 0.65,
     minTrackingConfidence: 0.7,
@@ -52,8 +52,11 @@ export function detectPose(
 ): PoseResult | null {
   if (!landmarker) return null;
   const result = landmarker.detectForVideo(video, ts);
+
   const raw: Array<{ x: number; y: number; z?: number; visibility?: number }> =
-    (result?.landmarks?.[0] ?? []) as any;
+    (result?.landmarks?.[0] ?? []) as Array<{
+      x: number; y: number; z?: number; visibility?: number;
+    }>;
 
   const keypoints: PoseKeypoint[] = raw.map((p) => ({
     x: p.x, y: p.y, z: p.z, visibility: p.visibility,
@@ -61,3 +64,4 @@ export function detectPose(
 
   return { keypoints, timestamp: ts };
 }
+
