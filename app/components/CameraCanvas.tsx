@@ -3,11 +3,18 @@ import { useEffect, useRef, useState } from 'react'
 import { initPose, detectPose, isReady } from '@/app/lib/pose/loader'
 import { EDGES, KP } from '@/app/lib/pose/topology'
 import { angleABC, trunkAngle, ema } from '@/app/lib/math/angles'
-import { createFSM, stepFSM } from '@/app/lib/logic/fsm'
+import { createFSM, stepFSM, type State } from '@/app/lib/logic/fsm'
 import { useTTS } from '@/app/lib/audio/useTTS'
 import { TemporalGate } from '@/app/lib/logic/temporal'
 import { checkRulesAtBottom } from '@/app/lib/logic/rules'
 
+/**
+ * Camera + overlay + angles + rep FSM + bottom-only TTS cues.
+ * Cleaned for ESLint:
+ *  - No unused vars
+ *  - No useEffect dependency warnings
+ *  - Local fpsNow used for HUD drawing (we still set state for the label below)
+ */
 export default function CameraCanvas() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -18,6 +25,7 @@ export default function CameraCanvas() {
   const [reps, setReps] = useState(0)
   const [camError, setCamError] = useState<string | null>(null)
 
+  // TTS hook: enable() must be called by a user gesture
   const { enabled, enable, speak } = useTTS(1200)
 
   useEffect(() => {
@@ -28,12 +36,9 @@ export default function CameraCanvas() {
     let kneeSmoothed: number | null = null
     let trunkSmoothed: number | null = null
 
-    // state machine + last state (to detect transitions)
+    // state machine + temporal gates
     let fsm = createFSM()
-    let lastState = fsm.state
-
-    // temporal gate for depth (require 4/6 recent frames true)
-    const depthGate = new TemporalGate(6, 4)
+    const depthGate = new TemporalGate(6, 4) // require 4/6 recent frames at depth
 
     // Avoid repeating the same cue within one rep
     let spokeCueTypeThisRep: null | 'depth' | 'trunk' | 'knee' = null
@@ -65,10 +70,15 @@ export default function CameraCanvas() {
       const loop = () => {
         const now = performance.now()
         const dt = now - last
-        if (dt > 0) setFps(1000 / dt)
+        // Local FPS for drawing; also update state for the small label under the canvas
+        const fpsNow = dt > 0 ? 1000 / dt : 0
+        setFps(fpsNow)
         last = now
 
-        if (!isReady()) { raf = requestAnimationFrame(loop); return }
+        if (!isReady()) {
+          raf = requestAnimationFrame(loop)
+          return
+        }
         const res = detectPose(v, now)
 
         c.width = v.videoWidth
@@ -78,7 +88,7 @@ export default function CameraCanvas() {
         if (res && res.keypoints.length) {
           const kps = res.keypoints
 
-          // --- Side-profile guard: require one side to be clearly visible ---
+          // --- Side-profile guard: require one side clearly visible ---
           const leftSideOK =
             (kps[KP.LEFT_HIP].visibility ?? 0) > 0.6 &&
             (kps[KP.LEFT_KNEE].visibility ?? 0) > 0.6 &&
@@ -89,7 +99,7 @@ export default function CameraCanvas() {
             (kps[KP.RIGHT_ANKLE].visibility ?? 0) > 0.6
           const profileOK = leftSideOK || rightSideOK
 
-          // Draw bones/joints regardless (helps user align)
+          // Draw bones/joints
           g.lineWidth = 3
           g.globalAlpha = 0.9
           g.strokeStyle = '#ffffff'
@@ -139,27 +149,26 @@ export default function CameraCanvas() {
           setTrunkDeg(Math.round(trunkSmoothed!))
 
           // --- Depth with margin + temporal gating ---
-          // Depth margin: require hip to be below knee by a bit (0.02 of image height)
-          const depthMargin = 0.02
+          const depthMargin = 0.02 // be below knee by a small margin
           const lDepthNow = kps[KP.LEFT_HIP].y > kps[KP.LEFT_KNEE].y + depthMargin
           const rDepthNow = kps[KP.RIGHT_HIP].y > kps[KP.RIGHT_KNEE].y + depthMargin
           const depthNow = lDepthNow && rDepthNow
           const depthOKSmoothed = depthGate.push(depthNow)
 
           // --- FSM and transitions ---
+          const prevState: State = fsm.state
           const prevReps = fsm.reps
-          const prevStateLocal = fsm.state
           fsm = stepFSM(fsm, hipC.y, depthOKSmoothed)
           setReps(fsm.reps)
 
           // New rep started → reset gate + rep cue memory
-          if (prevStateLocal === 'lockout' && fsm.state === 'descent') {
+          if (prevState === 'lockout' && fsm.state === 'descent') {
             depthGate.reset()
             spokeCueTypeThisRep = null
           }
 
-          // Speak ONLY on the transition into 'bottom' (reduces randomness)
-          const justHitBottom = prevStateLocal !== 'bottom' && fsm.state === 'bottom'
+          // Speak ONLY when we just entered 'bottom'
+          const justHitBottom = prevState !== 'bottom' && fsm.state === 'bottom'
           if (enabled && profileOK && justHitBottom) {
             const cues = checkRulesAtBottom({
               depthOK: depthOKSmoothed,
@@ -173,10 +182,10 @@ export default function CameraCanvas() {
             }
           }
 
-          // HUD
+          // HUD (use fpsNow here; not the state 'fps' to avoid deps)
           g.fillStyle = profileOK ? '#ffffff' : '#ff7070'
           g.font = '16px system-ui'
-          g.fillText(`FPS ${Math.round(fps)}`, 10, 20)
+          g.fillText(`FPS ${Math.round(fpsNow)}`, 10, 20)
           g.fillText(`Knee ${Math.round(kneeSmoothed || knee)}°`, 10, 40)
           g.fillText(`Trunk ${Math.round(trunkSmoothed || trunk)}°`, 10, 60)
           g.fillText(`Reps ${fsm.reps} | State ${fsm.state}`, 10, 80)
@@ -191,6 +200,7 @@ export default function CameraCanvas() {
 
     start().catch(console.error)
     return () => cancelAnimationFrame(raf)
+  // Only depend on TTS enable/speak so the loop restarts if that changes.
   }, [enabled, speak])
 
   return (
@@ -216,3 +226,4 @@ export default function CameraCanvas() {
     </div>
   )
 }
+
