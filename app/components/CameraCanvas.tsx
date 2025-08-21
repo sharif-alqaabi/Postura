@@ -8,6 +8,13 @@ import { useTTS } from '@/app/lib/audio/useTTS'
 import { TemporalGate } from '@/app/lib/logic/temporal'
 import { checkRulesAtBottom } from '@/app/lib/logic/rules'
 
+/**
+ * Camera + overlay + angles + rep FSM + bottom-only TTS cues
+ * - Toggle front/rear camera; mirror overlay when using front camera
+ * - Temporal gate for depth; cues only at bottom transition
+ * - Side-profile guard to reduce false cues
+ * - TTS enable + test button, and HUD shows last spoken cue
+ */
 export default function CameraCanvas() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -17,13 +24,14 @@ export default function CameraCanvas() {
   const [trunkDeg, setTrunkDeg] = useState<number | null>(null)
   const [reps, setReps] = useState(0)
   const [camError, setCamError] = useState<string | null>(null)
+  const [lastCue, setLastCue] = useState<string | null>(null)
 
-  // NEW: camera + mirroring controls
+  // Camera + mirroring controls
   const [useFront, setUseFront] = useState(true) // front/selfie by default
   const mirror = useFront // mirror both video & canvas together when using front camera
 
   // TTS (1.2s cooldown inside the hook)
-  const { enabled, enable, speak } = useTTS(1200)
+  const { enabled, enable, speak, test } = useTTS(1200)
 
   // Keep a handle to stop the previous stream when switching cameras
   const currentStream = useRef<MediaStream | null>(null)
@@ -32,13 +40,13 @@ export default function CameraCanvas() {
     let raf = 0
     let last = performance.now()
 
-    // smoothing accumulators
+    // Smoothing accumulators
     let kneeSmoothed: number | null = null
     let trunkSmoothed: number | null = null
 
-    // FSM + temporal gates
+    // FSM + temporal gate
     let fsm = createFSM()
-    const depthGate = new TemporalGate(6, 4) // require 4/6 depth frames at bottom
+    const depthGate = new TemporalGate(6, 4) // require 4/6 recent frames at depth
     let spokeCueTypeThisRep: null | 'depth' | 'trunk' | 'knee' = null
 
     async function start() {
@@ -50,6 +58,7 @@ export default function CameraCanvas() {
         currentStream.current = null
       }
 
+      // Guard for HTTPS / permissions
       if (
         typeof navigator === 'undefined' ||
         !navigator.mediaDevices ||
@@ -104,7 +113,7 @@ export default function CameraCanvas() {
         // === DRAW OVERLAY ===
         // NOTE: we are NOT drawing the video onto the canvas; the <video> sits behind.
         // If the <video> is mirrored via CSS, we also mirror the <canvas> element itself
-        // (via CSS transform below) so overlay matches.
+        // (via CSS transform in JSX) so overlay matches.
         if (res && res.keypoints.length) {
           const kps = res.keypoints
           const VIS = 0.2 // lower vis threshold a bit for stability
@@ -197,6 +206,7 @@ export default function CameraCanvas() {
             const first = cues.find(c => c.type !== spokeCueTypeThisRep)
             if (first) {
               speak(first.message)
+              setLastCue(first.message) // show in HUD in case audio is blocked
               spokeCueTypeThisRep = first.type
             }
           }
@@ -222,19 +232,33 @@ export default function CameraCanvas() {
       cancelAnimationFrame(raf)
       if (currentStream.current) currentStream.current.getTracks().forEach(t => t.stop())
     }
-  // restart loop when TTS or camera selection changes
+    // restart loop when TTS or camera selection changes
   }, [enabled, speak, useFront])
 
   return (
     <div style={{ maxWidth: 460, marginInline: 'auto' }}>
       {/* Controls */}
-      <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginBottom: 12 }}>
-        <button onClick={() => setUseFront(v => !v)} style={{ padding: '6px 10px', border: '1px solid #444', borderRadius: 10 }}>
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+        <button
+          onClick={() => setUseFront(v => !v)}
+          style={{ padding: '6px 10px', border: '1px solid #444', borderRadius: 10 }}
+        >
           {useFront ? 'Switch to Rear Camera' : 'Switch to Front Camera'}
         </button>
-        {!enabled && (
-          <button onClick={enable} style={{ padding: '6px 10px', border: '1px solid #444', borderRadius: 10 }}>
+
+        {!enabled ? (
+          <button
+            onClick={() => { enable(); test('Coaching enabled') }}
+            style={{ padding: '6px 10px', border: '1px solid #444', borderRadius: 10 }}
+          >
             Enable Coaching Audio
+          </button>
+        ) : (
+          <button
+            onClick={() => test('Voice check')}
+            style={{ padding: '6px 10px', border: '1px solid #444', borderRadius: 10 }}
+          >
+            Test Voice
           </button>
         )}
       </div>
@@ -244,10 +268,7 @@ export default function CameraCanvas() {
       )}
 
       {/* Mirror both video and canvas together when using front camera */}
-      <div style={{
-        position: 'relative',
-        transform: mirror ? 'scaleX(-1)' as const : 'none'
-      }}>
+      <div style={{ position: 'relative', transform: mirror ? 'scaleX(-1)' as const : 'none' }}>
         <video ref={videoRef} className="w-full rounded-2xl" playsInline muted />
         <canvas ref={canvasRef} className="w-full h-full absolute inset-0 pointer-events-none" />
       </div>
@@ -255,6 +276,7 @@ export default function CameraCanvas() {
       {/* simple label under the canvas (unmirrored) */}
       <div className="text-xs opacity-70 mt-2">
         FPS: {fps.toFixed(1)} | Reps: {reps} | Knee: {kneeDeg ?? '-'}° | Trunk: {trunkDeg ?? '-'}°
+        {lastCue ? <> | Last cue: <strong>{lastCue}</strong></> : null}
       </div>
     </div>
   )
